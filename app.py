@@ -53,7 +53,10 @@ def load_league(code):
 
 @st.cache_data(ttl=3 * 3600, show_spinner="Свалям програмата...")
 def load_fixtures():
-    return pd.read_csv(f"{BASE}/fixtures.csv", encoding="latin-1")
+    fx = pd.read_csv(f"{BASE}/fixtures.csv", encoding="latin-1")
+    # махаме невидимия знак (BOM) в началото на файла, който разваля името на първата колона
+    fx.columns = fx.columns.str.replace("ï»¿", "").str.replace("\ufeff", "").str.strip()
+    return fx
 
 
 # ---------------- МОДЕЛ ----------------
@@ -148,8 +151,12 @@ with tab_week:
     if st.button("Покажи прогнозите"):
         try:
             fx = load_fixtures()
-        except Exception:
+        except Exception as e:
+            st.error(f"Не успях да сваля програмата: {e}")
             fx = pd.DataFrame()
+        if not fx.empty and "Div" not in fx.columns:
+            st.error(f"Неочаквани колони във файла: {list(fx.columns)[:6]}")
+        st.caption(f"Мачове в програмата: {len(fx)}")
         rows = []
         for _, m in fx.iterrows():
             c = m.get("Div")
