@@ -35,6 +35,7 @@ FORM_OPTIONS = {
     "Силна (половин тежест след 3 месеца)": 90,
     "Много силна (половин тежест след 6 седмици)": 45,
 }
+VALUE_MIN = 0.10  # от каква разлика спрямо букмейкърите показваме ⭐
 COLS = ["Date", "Season", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "OddsH", "OddsD", "OddsA"]
 
 
@@ -126,19 +127,72 @@ def team_strengths(df, half_life=None, ref_date=None):
     return s, home_avg, away_avg
 
 
-def calc(model, home, away):
-    """Прогноза от вече изчислени сили. Връща речник или None, ако липсват данни."""
-    s, home_avg, away_avg = model
-    if home not in s.index or away not in s.index or s.loc[[home, away]].isna().any().any():
-        return None
+def tau(i, j, lh, la, rho):
+    """
+    Корекция на Dixon-Coles за ниските резултати (0:0, 1:0, 0:1, 1:1).
+    Простият модел подценява равенствата; при rho < 0 те стават по-вероятни.
+    """
+    if i == 0 and j == 0:
+        return 1 - lh * la * rho
+    if i == 0 and j == 1:
+        return 1 + lh * rho
+    if i == 1 and j == 0:
+        return 1 + la * rho
+    if i == 1 and j == 1:
+        return 1 - rho
+    return 1.0
+
+
+def expected_goals(strengths, home, away):
+    s, home_avg, away_avg = strengths
     exp_h = s.loc[home, "Атака дома"] * s.loc[away, "Защита навън"] * home_avg
     exp_a = s.loc[away, "Атака навън"] * s.loc[home, "Защита дома"] * away_avg
+    return exp_h, exp_a
+
+
+def estimate_rho(df, strengths):
+    """Намира rho, което най-добре обяснява честотата на 0:0, 1:0, 0:1 и 1:1 в първенството."""
+    s = strengths[0]
+    ok = df["HomeTeam"].isin(s.index) & df["AwayTeam"].isin(s.index)
+    low = df[ok & (df["FTHG"] <= 1) & (df["FTAG"] <= 1)]
+    if len(low) < 30:
+        return 0.0
+    games = [(int(m.FTHG), int(m.FTAG), *expected_goals(strengths, m.HomeTeam, m.AwayTeam))
+             for m in low.itertuples()]
+    best_rho, best_ll = 0.0, -float("inf")
+    for k in range(-25, 16):  # rho от -0.25 до 0.15
+        rho = k / 100
+        vals = [tau(i, j, lh, la, rho) for i, j, lh, la in games]
+        if min(vals) <= 0:
+            continue
+        ll = sum(math.log(v) for v in vals)
+        if ll > best_ll:
+            best_rho, best_ll = rho, ll
+    return best_rho
+
+
+def build_model(df, half_life=None, ref_date=None, use_dc=True, rho=None):
+    """Модел = сили на отборите + корекция за равенства."""
+    strengths = team_strengths(df, half_life, ref_date)
+    if not use_dc:
+        rho = 0.0
+    elif rho is None:
+        rho = estimate_rho(df, strengths)
+    return (*strengths, rho)
+
+
+def calc(model, home, away):
+    """Прогноза от вече изчислен модел. Връща речник или None, ако липсват данни."""
+    s, home_avg, away_avg, rho = model
+    if home not in s.index or away not in s.index or s.loc[[home, away]].isna().any().any():
+        return None
+    exp_h, exp_a = expected_goals((s, home_avg, away_avg), home, away)
 
     p1 = px = p2 = over = btts = 0
     scores = []
     for i in range(10):
         for j in range(10):
-            p = poisson(i, exp_h) * poisson(j, exp_a)
+            p = poisson(i, exp_h) * poisson(j, exp_a) * tau(i, j, exp_h, exp_a, rho)
             scores.append((f"{i}:{j}", p))
             if i > j:
                 p1 += p
@@ -229,8 +283,17 @@ def head_to_head(df, a, b, n=6):
 
 
 # ---------------- ПРОВЕРКА НА ТОЧНОСТТА ----------------
+def implied_probs(oh, od, oa):
+    """Вероятностите, които букмейкърите влагат в коефициентите (без тяхната печалба)."""
+    if not all(pd.notna(v) and v > 1 for v in (oh, od, oa)):
+        return None
+    raw = {"1": 1 / oh, "X": 1 / od, "2": 1 / oa}
+    total = sum(raw.values())
+    return {k: v / total for k, v in raw.items()}
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def backtest(code, half_life, n_test=250):
+def backtest(code, half_life, use_dc, n_test=250):
     """
     Пуска модела върху последните n_test изиграни мача.
     За всеки ден моделът се "обучава" само с мачовете ПРЕДИ него - както в реалността.
@@ -239,13 +302,18 @@ def backtest(code, half_life, n_test=250):
     if len(df) < 200:
         return None
     test = df.iloc[-n_test:]
-    hits = over_hits = book_hits = book_n = n = 0
+    # корекцията за равенства се изчислява веднъж, от мачовете преди тестовия период
+    before = df[df["Date"] < test["Date"].iloc[0]]
+    rho = build_model(before, half_life, use_dc=use_dc)[3] if len(before) >= 150 else 0.0
+
+    hits = over_hits = n = 0
     p_actual = 0.0
+    book = {"n": 0, "hits": 0, "p_actual": 0.0}
     for day, games in test.groupby("Date"):
         train = df[df["Date"] < day]
         if len(train) < 150:
             continue
-        model = team_strengths(train, half_life, day)
+        model = build_model(train, half_life, day, use_dc=use_dc, rho=rho)
         for _, m in games.iterrows():
             r = calc(model, m["HomeTeam"], m["AwayTeam"])
             if r is None:
@@ -255,10 +323,11 @@ def backtest(code, half_life, n_test=250):
             hits += favourite(r) == actual
             p_actual += r[actual]
             over_hits += (r["over"] > 0.5) == (m["FTHG"] + m["FTAG"] > 2)
-            odds = {"1": m["OddsH"], "X": m["OddsD"], "2": m["OddsA"]}
-            if all(pd.notna(v) and v > 1 for v in odds.values()):
-                book_n += 1
-                book_hits += min(odds, key=odds.get) == actual
+            bp = implied_probs(m["OddsH"], m["OddsD"], m["OddsA"])
+            if bp:
+                book["n"] += 1
+                book["hits"] += max(bp, key=bp.get) == actual
+                book["p_actual"] += bp[actual]
     if n == 0:
         return None
     return {
@@ -266,7 +335,10 @@ def backtest(code, half_life, n_test=250):
         "acc": hits / n,
         "p_actual": p_actual / n,
         "over_acc": over_hits / n,
-        "book_acc": book_hits / book_n if book_n else None,
+        "rho": rho,
+        "book_n": book["n"],
+        "book_acc": book["hits"] / book["n"] if book["n"] else None,
+        "book_p_actual": book["p_actual"] / book["n"] if book["n"] else None,
     }
 
 
@@ -340,6 +412,9 @@ with st.sidebar:
                               help="Колко повече да тежат последните мачове спрямо по-старите. "
                                    "В раздел „Точност на модела“ виждаш коя настройка е най-точна.")
     HALF_LIFE = FORM_OPTIONS[form_label]
+    USE_DC = st.toggle("Корекция за равенства", value=True,
+                       help="Метод на Dixon-Coles: простият модел подценява резултати като 0:0 и 1:1. "
+                            "Корекцията се изчислява от данните на всяко първенство поотделно.")
     st.divider()
     st.caption("Данни: football-data.co.uk. Резултатите се обновяват няколко пъти седмично, "
                "след изиграните кръгове.")
@@ -355,161 +430,4 @@ with tab_match:
     except Exception:
         data = pd.DataFrame()
     if data.empty:
-        st.error("Не успях да сваля данни за това първенство.")
-    else:
-        recent = data[data["Date"] >= data["Date"].max() - pd.Timedelta(days=400)]
-        team_list = sorted(set(recent["HomeTeam"]) | set(recent["AwayTeam"]))
-        c1, c2 = st.columns(2)
-        home = c1.selectbox("Домакин", team_list, index=0)
-        away = c2.selectbox("Гост", team_list, index=min(1, len(team_list) - 1))
-
-        if home == away:
-            st.warning("Избери два различни отбора.")
-        else:
-            r = calc(team_strengths(data, HALF_LIFE), home, away)
-            if r is None:
-                st.warning("Няма достатъчно мачове за някой от отборите.")
-            else:
-                st.markdown(match_card(home, away, r), unsafe_allow_html=True)
-
-                st.write("**Най-вероятни резултати**")
-                top = pd.DataFrame(r["top"], columns=["Резултат", "Вероятност"])
-                top["Вероятност"] = (top["Вероятност"] * 100).round()
-                st.dataframe(top, hide_index=True, use_container_width=False,
-                             column_config={"Вероятност": PCT("Вероятност")})
-
-            # --- Форма на двата отбора ---
-            st.divider()
-            st.subheader("Форма в последните 5 мача")
-            f1, f2 = st.columns(2)
-            for col, team in ((f1, home), (f2, away)):
-                col.markdown(f"**{team}** {form_icons(data, team)}")
-                col.dataframe(last_matches_table(data, team), hide_index=True, use_container_width=True)
-
-            st.write("**Точки в последните 10 мача** (натрупани)")
-            chart = pd.DataFrame({
-                t: team_matches(data, t).head(10)["Точки"].iloc[::-1].cumsum().reset_index(drop=True)
-                for t in (home, away)
-            })
-            chart.index = chart.index + 1
-            st.line_chart(chart, x_label="Мач", y_label="Точки")
-
-            # --- Последни срещи ---
-            st.subheader("Последни срещи между двата отбора")
-            h2h = head_to_head(data, home, away)
-            if h2h.empty:
-                st.info("Няма срещи между тези отбори в последните сезони.")
-            else:
-                st.dataframe(h2h, hide_index=True, use_container_width=False)
-
-# --- Класиране ---
-with tab_standings:
-    code_s = st.selectbox("Първенство", list(ALL), format_func=lambda c: ALL[c], key="standings_league")
-    try:
-        ds = load_league(code_s)
-    except Exception:
-        ds = pd.DataFrame()
-    if ds.empty:
-        st.error("Не успях да сваля данни за това първенство.")
-    else:
-        table, season = league_table(ds)
-        st.caption(f"Сезон {season} · последен изигран мач: {ds['Date'].max():%d.%m.%Y} · "
-                   f"Форма: последните 5 мача, отляво надясно към най-новия (🟢 победа, 🟡 равен, 🔴 загуба)")
-        st.dataframe(table, hide_index=True, use_container_width=True, height=35 * (len(table) + 1) + 3)
-
-# --- Всички предстоящи мачове ---
-with tab_week:
-    st.write("Прогнози за предстоящите мачове в главните европейски първенства.")
-    if st.button("Покажи прогнозите"):
-        try:
-            fx = load_fixtures()
-        except Exception as e:
-            st.error(f"Не успях да сваля програмата: {e}")
-            fx = pd.DataFrame()
-        if not fx.empty and "Div" not in fx.columns:
-            st.error(f"Неочаквани колони във файла: {list(fx.columns)[:6]}")
-        st.caption(f"Мачове в програмата: {len(fx)}")
-        models, rows = {}, []
-        for _, m in fx.iterrows():
-            c = m.get("Div")
-            if c not in MAIN:
-                continue
-            try:
-                if c not in models:
-                    models[c] = team_strengths(load_league(c), HALF_LIFE)
-                r = calc(models[c], m["HomeTeam"], m["AwayTeam"])
-            except Exception:
-                r = None
-            if r is None:
-                continue
-            rows.append({
-                "Дата": m["Date"], "Първенство": MAIN[c],
-                "Домакин": m["HomeTeam"], "Гост": m["AwayTeam"],
-                "1": round(r["1"] * 100), "X": round(r["X"] * 100), "2": round(r["2"] * 100),
-                "Фаворит": favourite(r), "Над 2.5": round(r["over"] * 100),
-                "ДВ": round(r["btts"] * 100), "Резултат": r["top"][0][0],
-            })
-        if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                         column_config={k: PCT(k) for k in ["1", "X", "2", "Над 2.5", "ДВ"]})
-            st.caption("ДВ = двата отбора вкарват")
-        else:
-            st.info("В момента няма предстоящи мачове в програмата.")
-
-# --- Сила на отборите ---
-with tab_table:
-    code_t = st.selectbox("Първенство ", list(ALL), format_func=lambda c: ALL[c], key="table_league")
-    try:
-        d = load_league(code_t)
-    except Exception:
-        d = pd.DataFrame()
-    if d.empty:
-        st.error("Не успях да сваля данни за това първенство.")
-    else:
-        s, _, _ = team_strengths(d, HALF_LIFE)
-        recent = d[d["Date"] >= d["Date"].max() - pd.Timedelta(days=400)]
-        s = s[s.index.isin(set(recent["HomeTeam"]))]
-        st.caption("Атака над 1.0 = вкарва повече от средното. Защита под 1.0 = допуска по-малко от средното.")
-        st.dataframe(s.sort_values("Атака дома", ascending=False).round(2), use_container_width=True)
-
-# --- Точност на модела ---
-with tab_acc:
-    st.write("Пускаме модела върху последните **250 изиграни мача**, като за всеки мач "
-             "използваме само резултатите **преди** него. Така виждаме колко би бил точен в реалността.")
-    code_a = st.selectbox("Първенство  ", list(ALL), format_func=lambda c: ALL[c], key="acc_league")
-    if st.button("Провери точността"):
-        rows = []
-        book = None
-        progress = st.progress(0.0, text="Проверявам...")
-        for i, (label, hl) in enumerate(FORM_OPTIONS.items()):
-            res = backtest(code_a, hl)
-            progress.progress((i + 1) / len(FORM_OPTIONS), text=f"Проверявам: {label}")
-            if res is None:
-                continue
-            book = res["book_acc"] if res["book_acc"] is not None else book
-            rows.append({
-                "Тежест на формата": label,
-                "Познат изход (1/X/2)": res["acc"],
-                "Среден шанс за реалния изход": res["p_actual"],
-                "Познати над/под 2.5": res["over_acc"],
-                "Мачове": res["n"],
-            })
-        progress.empty()
-
-        if not rows:
-            st.warning("Няма достатъчно данни за това първенство.")
-        else:
-            table = pd.DataFrame(rows)
-            best = table.loc[table["Среден шанс за реалния изход"].idxmax(), "Тежест на формата"]
-            show = table.copy()
-            for col in ["Познат изход (1/X/2)", "Среден шанс за реалния изход", "Познати над/под 2.5"]:
-                show[col] = show[col].map(lambda p: f"{p:.1%}")
-            st.dataframe(show, hide_index=True, use_container_width=True)
-
-            st.success(f"Най-добра настройка за {ALL[code_a]}: **{best}**. "
-                       f"Можеш да я избереш в менюто „Настройки“ вляво.")
-            if book is not None:
-                st.info(f"За сравнение: фаворитът на букмейкърите е печелил в **{book:.1%}** от същите мачове.")
-            st.caption("„Среден шанс за реалния изход“ е най-честната мярка: колко вероятност е дал моделът "
-                       "на това, което реално се случи. По-високото е по-добре. "
-                       "Познаването на 1/X/2 рядко минава 50-55%, защото футболът е непредсказуем.")
+        st.error("Не успях да сваля данни за това
