@@ -1,3 +1,4 @@
+import html
 import math
 
 import pandas as pd
@@ -269,10 +270,69 @@ def backtest(code, half_life, n_test=250):
     }
 
 
+# ---------------- ДИЗАЙН ----------------
+CSS = """<style>
+.block-container {padding-top: 2rem; max-width: 1200px;}
+.hero {background: linear-gradient(135deg, #14532d 0%, #0b1220 75%); border: 1px solid #1f2a44;
+       border-radius: 16px; padding: 22px 26px; margin-bottom: 1rem;}
+.hero h1 {margin: 0; padding: 0; font-size: 2rem; color: #fff;}
+.hero p {margin: .35rem 0 0; color: #9ca3af;}
+.match-card {background: #131c2e; border: 1px solid #1f2a44; border-radius: 16px; padding: 22px; margin: 1rem 0;}
+.teams {display: flex; justify-content: space-between; align-items: center; gap: 12px;}
+.team {flex: 1; font-size: 1.4rem; font-weight: 700; color: #fff;}
+.team.away {text-align: right;}
+.xg {text-align: center;}
+.xg .v {font-size: 1.6rem; font-weight: 800; color: #22c55e; white-space: nowrap;}
+.xg .l {color: #9ca3af; font-size: .75rem;}
+.bar {display: flex; height: 38px; border-radius: 10px; overflow: hidden; margin-top: 18px;
+      font-weight: 700; color: #fff; font-size: .9rem;}
+.bar div {display: flex; align-items: center; justify-content: center;}
+.b1 {background: #16a34a;} .bx {background: #4b5563;} .b2 {background: #2563eb;}
+.legend {display: flex; justify-content: space-between; color: #9ca3af; font-size: .8rem; margin-top: 6px;}
+.stats {display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px;}
+.stat {background: #0b1220; border: 1px solid #1f2a44; border-radius: 12px; padding: 12px; text-align: center;}
+.stat .v {font-size: 1.4rem; font-weight: 800; color: #fff;}
+.stat .l {color: #9ca3af; font-size: .8rem;}
+@media (max-width: 640px) {
+  .team {font-size: 1.05rem;} .xg .v {font-size: 1.2rem;} .stat .v {font-size: 1.1rem;}
+}
+</style>"""
+
+
+def match_card(home, away, r):
+    """Карта на мача: имена, очаквани голове, цветна лента 1/X/2 и голове."""
+    h, a = html.escape(home), html.escape(away)
+
+    def seg(cls, p):
+        label = f"{p:.0%}" if p >= 0.08 else ""
+        return f'<div class="{cls}" style="width:{p * 100:.1f}%">{label}</div>'
+
+    return "".join([
+        '<div class="match-card">',
+        '<div class="teams">',
+        f'<div class="team">{h}</div>',
+        f'<div class="xg"><div class="v">{r["exp_h"]:.1f} : {r["exp_a"]:.1f}</div>'
+        '<div class="l">очаквани голове</div></div>',
+        f'<div class="team away">{a}</div>',
+        '</div>',
+        '<div class="bar">', seg("b1", r["1"]), seg("bx", r["X"]), seg("b2", r["2"]), '</div>',
+        f'<div class="legend"><span>1 · победа {h}</span><span>X · равен</span><span>2 · победа {a}</span></div>',
+        '<div class="stats">',
+        f'<div class="stat"><div class="v">{r["over"]:.0%}</div><div class="l">Над 2.5 гола</div></div>',
+        f'<div class="stat"><div class="v">{1 - r["over"]:.0%}</div><div class="l">Под 2.5 гола</div></div>',
+        f'<div class="stat"><div class="v">{r["btts"]:.0%}</div><div class="l">Двата вкарват</div></div>',
+        '</div></div>',
+    ])
+
+
+PCT = lambda label: st.column_config.ProgressColumn(label, format="%d%%", min_value=0, max_value=100)
+
 # ---------------- САЙТ ----------------
 st.set_page_config(page_title="Футболни прогнози", page_icon="⚽", layout="wide")
-st.title("⚽ Футболни прогнози")
-st.caption("Поасонов модел върху резултатите от последните сезони. Само за забавление, не за залози.")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>⚽ Футболни прогнози</h1>'
+            '<p>Поасонов модел върху резултатите от последните сезони · 32 първенства · '
+            'само за забавление, не за залози</p></div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Настройки")
@@ -310,21 +370,13 @@ with tab_match:
             if r is None:
                 st.warning("Няма достатъчно мачове за някой от отборите.")
             else:
-                st.subheader(f"{home} - {away}")
-                st.write(f"Очаквани голове: **{r['exp_h']:.2f} - {r['exp_a']:.2f}**")
-                m1, m2, m3 = st.columns(3)
-                m1.metric(f"1 · {home}", f"{r['1']:.0%}")
-                m2.metric("X · равен", f"{r['X']:.0%}")
-                m3.metric(f"2 · {away}", f"{r['2']:.0%}")
-                g1, g2, g3 = st.columns(3)
-                g1.metric("Над 2.5 гола", f"{r['over']:.0%}")
-                g2.metric("Под 2.5 гола", f"{1 - r['over']:.0%}")
-                g3.metric("Двата отбора вкарват", f"{r['btts']:.0%}")
+                st.markdown(match_card(home, away, r), unsafe_allow_html=True)
 
                 st.write("**Най-вероятни резултати**")
                 top = pd.DataFrame(r["top"], columns=["Резултат", "Вероятност"])
-                top["Вероятност"] = top["Вероятност"].map(lambda p: f"{p:.0%}")
-                st.dataframe(top, hide_index=True, use_container_width=False)
+                top["Вероятност"] = (top["Вероятност"] * 100).round()
+                st.dataframe(top, hide_index=True, use_container_width=False,
+                             column_config={"Вероятност": PCT("Вероятност")})
 
             # --- Форма на двата отбора ---
             st.divider()
@@ -393,12 +445,13 @@ with tab_week:
             rows.append({
                 "Дата": m["Date"], "Първенство": MAIN[c],
                 "Домакин": m["HomeTeam"], "Гост": m["AwayTeam"],
-                "1": f"{r['1']:.0%}", "X": f"{r['X']:.0%}", "2": f"{r['2']:.0%}",
-                "Фаворит": favourite(r), "Над 2.5": f"{r['over']:.0%}",
-                "ДВ": f"{r['btts']:.0%}", "Резултат": r["top"][0][0],
+                "1": round(r["1"] * 100), "X": round(r["X"] * 100), "2": round(r["2"] * 100),
+                "Фаворит": favourite(r), "Над 2.5": round(r["over"] * 100),
+                "ДВ": round(r["btts"] * 100), "Резултат": r["top"][0][0],
             })
         if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                         column_config={k: PCT(k) for k in ["1", "X", "2", "Над 2.5", "ДВ"]})
             st.caption("ДВ = двата отбора вкарват")
         else:
             st.info("В момента няма предстоящи мачове в програмата.")
