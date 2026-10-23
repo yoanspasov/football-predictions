@@ -34,7 +34,7 @@ FORM_OPTIONS = {
     "Силна (половин тежест след 3 месеца)": 90,
     "Много силна (половин тежест след 6 седмици)": 45,
 }
-COLS = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "OddsH", "OddsD", "OddsA"]
+COLS = ["Date", "Season", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "OddsH", "OddsD", "OddsA"]
 
 
 # ---------------- ДАННИ ----------------
@@ -68,6 +68,7 @@ def load_league(code):
         for s in SEASONS:
             try:
                 df = clean_columns(pd.read_csv(f"{BASE}/mmz4281/{s}/{code}.csv", encoding="latin-1"))
+                df["Season"] = s
                 frames.append(add_odds(df, ["Avg", "B365", "PS"]))
             except Exception:
                 pass
@@ -162,6 +163,70 @@ def favourite(r):
     return max(["1", "X", "2"], key=lambda k: r[k])
 
 
+# ---------------- КЛАСИРАНЕ И ФОРМА ----------------
+ICON = {"П": "🟢", "Р": "🟡", "З": "🔴"}  # победа, равен, загуба
+
+
+def team_matches(df, team):
+    """Мачовете на един отбор, гледани от негова гледна точка (най-новите първи)."""
+    m = df[(df["HomeTeam"] == team) | (df["AwayTeam"] == team)].copy()
+    home = m["HomeTeam"] == team
+    m["Срещу"] = m["AwayTeam"].where(home, m["HomeTeam"])
+    m["Къде"] = home.map({True: "дома", False: "навън"})
+    m["За"] = m["FTHG"].where(home, m["FTAG"]).astype(int)
+    m["Против"] = m["FTAG"].where(home, m["FTHG"]).astype(int)
+    m["Изход"] = "Р"
+    m.loc[m["За"] > m["Против"], "Изход"] = "П"
+    m.loc[m["За"] < m["Против"], "Изход"] = "З"
+    m["Точки"] = m["Изход"].map({"П": 3, "Р": 1, "З": 0})
+    return m.sort_values("Date", ascending=False)
+
+
+def form_icons(df, team, n=5):
+    """Последните n мача като цветни точки, от най-стария към най-новия."""
+    last = team_matches(df, team).head(n)["Изход"].tolist()[::-1]
+    return "".join(ICON[x] for x in last)
+
+
+def league_table(df):
+    """Класиране за текущия сезон."""
+    season = df["Season"].iloc[-1]
+    cur = df[df["Season"] == season]
+    rows = []
+    for team in set(cur["HomeTeam"]) | set(cur["AwayTeam"]):
+        m = team_matches(cur, team)
+        w, d, l = (m["Изход"] == "П").sum(), (m["Изход"] == "Р").sum(), (m["Изход"] == "З").sum()
+        gf, ga = m["За"].sum(), m["Против"].sum()
+        rows.append({"Отбор": team, "М": len(m), "П": w, "Р": d, "З": l,
+                     "Голове": f"{gf}:{ga}", "ГР": gf - ga, "Т": 3 * w + d,
+                     "_gf": gf, "Форма": form_icons(cur, team)})
+    t = pd.DataFrame(rows).sort_values(["Т", "ГР", "_gf"], ascending=False).drop(columns="_gf")
+    t.insert(0, "#", range(1, len(t) + 1))
+    return t, season
+
+
+def last_matches_table(df, team, n=5):
+    m = team_matches(df, team).head(n)
+    return pd.DataFrame({
+        "Дата": m["Date"].dt.strftime("%d.%m.%Y"),
+        "Срещу": m["Срещу"],
+        "Къде": m["Къде"],
+        "Резултат": m["За"].astype(str) + ":" + m["Против"].astype(str),
+        "": m["Изход"].map(ICON),
+    })
+
+
+def head_to_head(df, a, b, n=6):
+    m = df[((df["HomeTeam"] == a) & (df["AwayTeam"] == b)) |
+           ((df["HomeTeam"] == b) & (df["AwayTeam"] == a))].sort_values("Date", ascending=False).head(n)
+    return pd.DataFrame({
+        "Дата": m["Date"].dt.strftime("%d.%m.%Y"),
+        "Домакин": m["HomeTeam"],
+        "Резултат": m["FTHG"].astype(int).astype(str) + ":" + m["FTAG"].astype(int).astype(str),
+        "Гост": m["AwayTeam"],
+    })
+
+
 # ---------------- ПРОВЕРКА НА ТОЧНОСТТА ----------------
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def backtest(code, half_life, n_test=250):
@@ -215,9 +280,12 @@ with st.sidebar:
                               help="Колко повече да тежат последните мачове спрямо по-старите. "
                                    "В раздел „Точност на модела“ виждаш коя настройка е най-точна.")
     HALF_LIFE = FORM_OPTIONS[form_label]
+    st.divider()
+    st.caption("Данни: football-data.co.uk. Резултатите се обновяват няколко пъти седмично, "
+               "след изиграните кръгове.")
 
-tab_match, tab_week, tab_table, tab_acc = st.tabs(
-    ["Прогноза за мач", "Мачове тази седмица", "Сила на отборите", "Точност на модела"])
+tab_match, tab_week, tab_standings, tab_table, tab_acc = st.tabs(
+    ["Прогноза за мач", "Мачове тази седмица", "Класиране", "Сила на отборите", "Точност на модела"])
 
 # --- Прогноза за един мач ---
 with tab_match:
@@ -257,6 +325,45 @@ with tab_match:
                 top = pd.DataFrame(r["top"], columns=["Резултат", "Вероятност"])
                 top["Вероятност"] = top["Вероятност"].map(lambda p: f"{p:.0%}")
                 st.dataframe(top, hide_index=True, use_container_width=False)
+
+            # --- Форма на двата отбора ---
+            st.divider()
+            st.subheader("Форма в последните 5 мача")
+            f1, f2 = st.columns(2)
+            for col, team in ((f1, home), (f2, away)):
+                col.markdown(f"**{team}** {form_icons(data, team)}")
+                col.dataframe(last_matches_table(data, team), hide_index=True, use_container_width=True)
+
+            st.write("**Точки в последните 10 мача** (натрупани)")
+            chart = pd.DataFrame({
+                t: team_matches(data, t).head(10)["Точки"].iloc[::-1].cumsum().reset_index(drop=True)
+                for t in (home, away)
+            })
+            chart.index = chart.index + 1
+            st.line_chart(chart, x_label="Мач", y_label="Точки")
+
+            # --- Последни срещи ---
+            st.subheader("Последни срещи между двата отбора")
+            h2h = head_to_head(data, home, away)
+            if h2h.empty:
+                st.info("Няма срещи между тези отбори в последните сезони.")
+            else:
+                st.dataframe(h2h, hide_index=True, use_container_width=False)
+
+# --- Класиране ---
+with tab_standings:
+    code_s = st.selectbox("Първенство", list(ALL), format_func=lambda c: ALL[c], key="standings_league")
+    try:
+        ds = load_league(code_s)
+    except Exception:
+        ds = pd.DataFrame()
+    if ds.empty:
+        st.error("Не успях да сваля данни за това първенство.")
+    else:
+        table, season = league_table(ds)
+        st.caption(f"Сезон {season} · последен изигран мач: {ds['Date'].max():%d.%m.%Y} · "
+                   f"Форма: последните 5 мача, отляво надясно към най-новия (🟢 победа, 🟡 равен, 🔴 загуба)")
+        st.dataframe(table, hide_index=True, use_container_width=True, height=35 * (len(table) + 1) + 3)
 
 # --- Всички предстоящи мачове ---
 with tab_week:
